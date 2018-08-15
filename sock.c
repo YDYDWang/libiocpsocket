@@ -21,6 +21,13 @@ typedef void(*RECEIVE_LISTENER)(char *);
 
 /**typedef EVENT_LISTENER *PEVENT_LISTENER;*/
 
+typedef enum {
+	UNKNOWN
+	, ACCEPT
+	, READ
+	, WRITE
+} OPERATION;
+
 typedef struct _EVENTS {
 	EVENT_LISTENER connect_listener;
 	EVENT_LISTENER receive_listener;
@@ -40,11 +47,18 @@ typedef struct _SERVER_CONTEXT {
 } SERVER_CONTEXT, *PSERVER_CONTEXT;
 
 typedef struct _SOCKET_CONTEXT {
+	WSAOVERLAPPED overlap;
 	SOCKET socket;
 	WSABUF wsabuf;
 	DWORD receive_length;
-	WSAOVERLAPPED overlap;
 } SOCKET_CONTEXT, *PSOCKET_CONTEXT;
+
+typedef struct _IO_CONTEXT {
+	WSAOVERLAPPED overlap;
+	WSABUF wsabuf;
+	PSOCKET_CONTEXT socket_context;
+	OPERATION operation;
+} IO_CONTEXT, *PIO_CONTEXT;
 
 typedef struct _BUF {
 	WSABUF wsabuf;
@@ -78,7 +92,8 @@ BOOL init_server_context(PCWSTR port, DWORD buffer_size, EVENT_LISTENER connect_
 	}
 	s->size = buffer_size;
 	s->guid = (GUID) WSAID_ACCEPTEX;
-	if (!bind_to_iocp(s, s->iocp)) {
+	s->receive_length = 0;
+	if (!bind_to_iocp_for_server_context(s, s->iocp)) {
 		return FALSE;
 	}
 	if (!init_wasiIoctl(s->socket, s->guid, &s->acceptex, &s->receive_length)) {
@@ -97,11 +112,32 @@ BOOL init_socket_context(PSOCKET_CONTEXT *socket_context, PADDRINFOW info, int s
 	s->wsabuf.buf = malloc(sizeof(size));
 	s->wsabuf.len = size;
 	ZeroMemory(&s->overlap, sizeof(s->overlap));
+	s->receive_length = 0;
 	if (s->wsabuf.buf == NULL) {
 		printf("[FATAL] Fail to allocate memory for SOCKET_CONTEXT->WSABUF.buf\n");
 		return FALSE;
 	}
 	if (!init_socket(&s->socket, info)) {
+		return FALSE;
+	}
+	return TRUE;
+}
+
+BOOL init_io_context(PIO_CONTEXT *io_context, PSOCKET_CONTEXT socket_context, int size, OPERATION operation) {
+	PIO_CONTEXT io = malloc(sizeof(IO_CONTEXT));
+	*io_context = io;
+	if (io == NULL) {
+		printf("[FATAL] Fail to allocate memory for IO_CONTEXT\n");
+		return FALSE;
+	}
+	io->wsabuf.buf = malloc(sizeof(size));
+	io->wsabuf.len = size;
+	ZeroMemory(&io->overlap, sizeof(io->overlap));
+	io->socket_context = socket_context;
+	io->operation = operation;
+	//s->receive_length = 0;
+	if (io->wsabuf.buf == NULL) {
+		printf("[FATAL] Fail to allocate memory for SOCKET_CONTEXT->WSABUF.buf\n");
 		return FALSE;
 	}
 	return TRUE;
@@ -203,7 +239,16 @@ BOOL do_accept(PSERVER_CONTEXT server_context, PSOCKET_CONTEXT socket_context) {
 }
 
 BOOL bind_to_iocp(PSOCKET_CONTEXT socket_context, HANDLE iocp) {
-	iocp = CreateIoCompletionPort((HANDLE) socket_context->socket, iocp, socket_context, 0);
+	iocp = CreateIoCompletionPort((HANDLE) socket_context->socket, iocp, NULL, 0);
+	if (iocp == NULL) {
+		printf("[FATAL]CreateIoCompletionPort failed with error code: %d\n", GetLastError());
+		return FALSE;
+	}
+	return TRUE;
+}
+
+BOOL bind_to_iocp_for_server_context(PSERVER_CONTEXT server_context, HANDLE iocp) {
+	iocp = CreateIoCompletionPort((HANDLE) server_context->socket, iocp, ACCEPT, 0);
 	if (iocp == NULL) {
 		printf("[FATAL]CreateIoCompletionPort failed with error code: %d\n", GetLastError());
 		return FALSE;
@@ -254,13 +299,6 @@ void disconnect_listener() {
 	printf("[DEBUG]disconnect\n");
 }
 
-/**unsigned __stdcall process2(void *parameter) {
-	PEVENTS events = parameter;
-	printf("DEBUG]Thread inside %d \n", GetCurrentThreadId());
-	events->connect_listener();
-	return 0;
-}*/
-
 BOOL init_events(PEVENTS *events, EVENT_LISTENER connect_listener
 	, EVENT_LISTENER receive_listener, EVENT_LISTENER disconnect_listener) {
 	 PEVENTS e = malloc(1, sizeof(EVENTS));
@@ -275,43 +313,75 @@ BOOL init_events(PEVENTS *events, EVENT_LISTENER connect_listener
 	 return TRUE;
  }
 
+void do_recv(PIO_CONTEXT io_context, LPDWORD flag) {
+	int code = WSARecv(
+		io_context->socket_context->socket,
+		&io_context->wsabuf,
+		1,
+		NULL,
+		flag,
+		&io_context->overlap,
+		NULL
+	);
+	if (code != NOERROR) {
+		int error = WSAGetLastError();
+		if (error != WSA_IO_PENDING) {
+			printf("[FATAL]WSARecv failed with error code: %d\n", error);
+			// TODO maybe we can disconnect socket
+		}
+	}
+}
+
 unsigned __stdcall process(void *parameter) {
 	PSERVER_CONTEXT server_context = parameter;
+	DWORD flag = 0;
 	printf("DEBUG]Thread inside %d \n", GetCurrentThreadId());
 	while (TRUE) {
-		PSOCKET_CONTEXT socket_context = NULL;
+		OPERATION operation = UNKNOWN;
 		LPOVERLAPPED overlap = NULL;
 		DWORD receive_length = NULL;
 		BOOL code = GetQueuedCompletionStatus(
 			server_context->iocp
 			, &receive_length
-			, &socket_context
+			, &operation
 			, &overlap
 			, INFINITE);
 		if (code == FALSE) {
 			printf("[FATAL]GetQueuedCompletionStatus failed with error code: %d\n", GetLastError());
 			continue;
 		}
-		printf("DEBUG]receive_length: %d \n", receive_length);
+		if (ACCEPT == operation) {
+			PSOCKET_CONTEXT socket_context = overlap;
+			PIO_CONTEXT io_context;
+			if (init_io_context(&io_context, socket_context, server_context->size, READ)) {
+				do_recv(io_context, &flag);
+			}
+		} else {
+			PIO_CONTEXT io_context = overlap;
+			if (io_context->operation == READ) {
+				fwrite(io_context->wsabuf.buf, 1, receive_length, stdout);
+				do_recv(io_context, &flag);
+			} else {
+				printf("[DEBUG]Unknown operation %d", io_context->operation);
+			}
+		}
+		//printf("[DEBUG]receive_length: %d \n", receive_length);
 	}
 	return 0;
 }
 
-BOOL new_server_socket(EVENT_LISTENER connect_listener, EVENT_LISTENER receive_listener
-	, EVENT_LISTENER disconnect_listener) {
-	PCWSTR port = L"9999";
-	DWORD buffer_size = 4096;
-	ADDRINFOW hints = new_hints();
+BOOL new_server_socket(PCWSTR port, DWORD buffer_size, PADDRINFOW hints, EVENT_LISTENER connect_listener
+	, EVENT_LISTENER receive_listener, EVENT_LISTENER disconnect_listener) {
 	PSERVER_CONTEXT server_context;
 	if (init_server_context(port, buffer_size, connect_listener
 		, receive_listener, disconnect_listener
-		, &hints, &server_context)
+		, hints, &server_context)
 		&& do_listen(server_context->socket, server_context->info)) {
 		SYSTEM_INFO systemInfo;
 		GetSystemInfo(&systemInfo);
 		unsigned int threadId = NULL;
 		for (DWORD i = 0; i < systemInfo.dwNumberOfProcessors; i++) {
-			PSERVER_CONTEXT socket_context;
+			PSOCKET_CONTEXT socket_context;
 			if (init_socket_context(&socket_context, server_context->info, buffer_size)
 				&& do_accept(server_context, socket_context)) {
 				HANDLE thread = _beginthreadex(NULL, 0, process, server_context, 0, &threadId);
@@ -322,20 +392,9 @@ BOOL new_server_socket(EVENT_LISTENER connect_listener, EVENT_LISTENER receive_l
 }
 
 int main(void) {
-	/**int size = 4096;
-	printf("sizeof(SOCKET_CONTEXT): %d\n", sizeof(SOCKET_CONTEXT));
-	printf("sizeof(WSAOVERLAPPED): %d\n", sizeof(WSAOVERLAPPED));
-	printf("sizeof(WSABUF): %d\n", sizeof(WSABUF));
-	printf("sizeof(ULONG): %d\n", sizeof(ULONG));
-	printf("sizeof(CHAR): %d\n", sizeof(CHAR));
-	printf("sizeof(SOCKADDR_STORAGE): %d\n", sizeof(SOCKADDR_STORAGE));
-	printf("sizeof(SOCKADDR_IN): %d\n", sizeof(SOCKADDR_IN));
-	printf("sizeof(GUID): %d\n", sizeof(GUID));
-	GUID guid = WSAID_ACCEPTEX;
-	printf("sizeof(WSAID_ACCEPTEX): %d\n", sizeof(guid));
-	printf("sizeof(SOCKET): %d\n", sizeof(SOCKET));*/
-	//PSOCKET_CONTEXT socket_context;
-	//init_socket_context(&socket_context, size);
-	new_server_socket(connect_listener, receive_listener, disconnect_listener);
+	PCWSTR port = L"9999";
+	DWORD buffer_size = 4096;
+	ADDRINFOW hints = new_hints();
+	new_server_socket(port, buffer_size, &hints, connect_listener, receive_listener, disconnect_listener);
 	getchar();
 }
