@@ -6,7 +6,6 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-#include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <stdio.h>
@@ -32,6 +31,8 @@ typedef struct _EVENTS {
 	EVENT_LISTENER connect_listener;
 	EVENT_LISTENER receive_listener;
 	EVENT_LISTENER disconnect_listener;
+	// log_listener
+	// error_listener
 } EVENTS, *PEVENTS;
 
 typedef struct _SERVER_CONTEXT {
@@ -40,10 +41,12 @@ typedef struct _SERVER_CONTEXT {
 	WSADATA wsadata;
 	HANDLE iocp;
 	LPFN_ACCEPTEX acceptex;
+	GUID acceptex_guid;
+	LPFN_GETACCEPTEXSOCKADDRS getacceptexsockaddrs;
+	GUID getacceptexsockaddrs_guid;
 	DWORD size;
 	DWORD receive_length;
 	PEVENTS events;
-	GUID guid;
 } SERVER_CONTEXT, *PSERVER_CONTEXT;
 
 typedef struct _SOCKET_CONTEXT {
@@ -70,33 +73,70 @@ BOOL init_server_context(PCWSTR port, DWORD buffer_size, EVENT_LISTENER connect_
 	, EVENT_LISTENER receive_listener, EVENT_LISTENER disconnect_listener
 	, PADDRINFOW hints, PSERVER_CONTEXT *server_context) {
 	PSERVER_CONTEXT s = malloc(sizeof(SERVER_CONTEXT));
-	*server_context = s;
 	if (s == NULL) {
 		printf("[FATAL] Fail to allocate memory for SOCKET_CONTEXT\n");
 		return FALSE;
 	}
+	*server_context = s;
 	if (!init_wsadata(&s->wsadata)) {
+		free(s);
 		return FALSE;
 	}
 	if (!init_server_info(port, hints, &s->info)) {
+		WSACleanup();
+		free(s);
 		return FALSE;
 	}
 	if (!init_socket(&s->socket, s->info)) {
+		FreeAddrInfoW(s->info);
+		WSACleanup();
+		free(s);
 		return FALSE;
 	}
 	if (!init_iocp(&s->iocp)) {
+		do_close_socket(s->socket);
+		FreeAddrInfoW(s->info);
+		WSACleanup();
+		free(s);
 		return FALSE;
 	}
 	if (!init_events(&s->events, connect_listener, receive_listener, disconnect_listener)) {
+		do_close_handle(s->socket);
+		do_close_socket(s->socket);
+		FreeAddrInfoW(s->info);
+		WSACleanup();
+		free(s);
 		return FALSE;
 	}
 	s->size = buffer_size;
-	s->guid = (GUID) WSAID_ACCEPTEX;
+	s->acceptex_guid = (GUID) WSAID_ACCEPTEX;
+	s->getacceptexsockaddrs_guid = (GUID) WSAID_GETACCEPTEXSOCKADDRS;
 	s->receive_length = 0;
 	if (!bind_to_iocp_for_server_context(s, s->iocp)) {
+		free(s->events);
+		do_close_handle(s->socket);
+		do_close_socket(s->socket);
+		FreeAddrInfoW(s->info);
+		WSACleanup();
+		free(s);
 		return FALSE;
 	}
-	if (!init_wasiIoctl(s->socket, s->guid, &s->acceptex, &s->receive_length)) {
+	if (!init_fn_acceptex(s->socket, s->acceptex_guid, &s->acceptex, &s->receive_length)) {
+		free(s->events);
+		do_close_handle(s->socket);
+		do_close_socket(s->socket);
+		FreeAddrInfoW(s->info);
+		WSACleanup();
+		free(s);
+		return FALSE;
+	}
+	if (!init_fn_getacceptexsockaddrs(s->socket, s->getacceptexsockaddrs_guid, &s->getacceptexsockaddrs, &s->receive_length)) {
+		free(s->events);
+		do_close_handle(s->socket);
+		do_close_socket(s->socket);
+		FreeAddrInfoW(s->info);
+		WSACleanup();
+		free(s);
 		return FALSE;
 	}
 	return TRUE;
@@ -104,20 +144,23 @@ BOOL init_server_context(PCWSTR port, DWORD buffer_size, EVENT_LISTENER connect_
 
 BOOL init_socket_context(PSOCKET_CONTEXT *socket_context, PADDRINFOW info, int size) {
 	PSOCKET_CONTEXT s = malloc(sizeof(SOCKET_CONTEXT));
-	*socket_context = s;
 	if (s == NULL) {
 		printf("[FATAL] Fail to allocate memory for SOCKET_CONTEXT\n");
 		return FALSE;
 	}
+	*socket_context = s;
 	s->wsabuf.buf = malloc(sizeof(size));
 	s->wsabuf.len = size;
 	ZeroMemory(&s->overlap, sizeof(s->overlap));
 	s->receive_length = 0;
 	if (s->wsabuf.buf == NULL) {
+		free(s);
 		printf("[FATAL] Fail to allocate memory for SOCKET_CONTEXT->WSABUF.buf\n");
 		return FALSE;
 	}
 	if (!init_socket(&s->socket, info)) {
+		free(s->wsabuf.buf);
+		free(s);
 		return FALSE;
 	}
 	return TRUE;
@@ -125,11 +168,11 @@ BOOL init_socket_context(PSOCKET_CONTEXT *socket_context, PADDRINFOW info, int s
 
 BOOL init_io_context(PIO_CONTEXT *io_context, PSOCKET_CONTEXT socket_context, int size, OPERATION operation) {
 	PIO_CONTEXT io = malloc(sizeof(IO_CONTEXT));
-	*io_context = io;
 	if (io == NULL) {
 		printf("[FATAL] Fail to allocate memory for IO_CONTEXT\n");
 		return FALSE;
 	}
+	*io_context = io;
 	io->wsabuf.buf = malloc(sizeof(size));
 	io->wsabuf.len = size;
 	ZeroMemory(&io->overlap, sizeof(io->overlap));
@@ -137,6 +180,7 @@ BOOL init_io_context(PIO_CONTEXT *io_context, PSOCKET_CONTEXT socket_context, in
 	io->operation = operation;
 	//s->receive_length = 0;
 	if (io->wsabuf.buf == NULL) {
+		free(io);
 		printf("[FATAL] Fail to allocate memory for SOCKET_CONTEXT->WSABUF.buf\n");
 		return FALSE;
 	}
@@ -152,27 +196,15 @@ BOOL init_wsadata(WSADATA *wsa_data) {
 	return TRUE;
 }
 
-ADDRINFOW new_hints() {
-	ADDRINFOW hints;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_flags = AI_PASSIVE;
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_IP;
-	hints.ai_addrlen = 0;
-	hints.ai_canonname = NULL;
-	hints.ai_addr = NULL;
-	hints.ai_next = NULL;
-	return hints;
-}
-
 BOOL init_server_info(PCWSTR port, PADDRINFOW hints, PADDRINFOW *server_info) {
 	int code = GetAddrInfoW(NULL, port, hints, server_info);
 	if (code != NO_ERROR) {
 		printf("[FATAL]GetAddrInfoW failed with error code: %d\n", WSAGetLastError());
+		if (server_info != NULL) {
+			FreeAddrInfoW(*server_info);
+		}
 		return FALSE;
-	}
-	if (server_info == NULL) {
+	} else if (server_info == NULL) {
 		printf("[FATAL]GetAddrInfoW failed resolve/convert the interface\n");
 		return FALSE;
 	}
@@ -193,10 +225,19 @@ BOOL init_socket(SOCKET *s, PADDRINFOW info) {
 	return TRUE;
 }
 
+BOOL do_close_socket(SOCKET s) {
+	int code = closesocket(s);
+	if (code != NOERROR) {
+		printf("[FATAL]closesocket failed with error code: %d\n", WSAGetLastError());
+		return FALSE;
+	}
+	return TRUE;
+}
+
 BOOL bind_to_server(SOCKET socket, PADDRINFOW info) {
 	int code = bind(socket
 		, info->ai_addr
-		, (int)info->ai_addrlen);
+		, (int) info->ai_addrlen);
 	if (code == SOCKET_ERROR) {
 		printf("[FATAL]bind failed with error code: %d\n", WSAGetLastError());
 		return FALSE;
@@ -229,6 +270,15 @@ BOOL init_iocp(HANDLE *iocp) {
 	return TRUE;
 }
 
+BOOL do_close_handle(HANDLE h) {
+	BOOL code = CloseHandle(h);
+	if (code == FALSE) {
+		printf("[FATAL]CloseHandle failed with error code: %d\n", GetLastError());
+		return FALSE;
+	}
+	return TRUE;
+}
+
 BOOL do_accept(PSERVER_CONTEXT server_context, PSOCKET_CONTEXT socket_context) {
 	if (!bind_to_iocp(socket_context, server_context->iocp)) {
 		return FALSE;
@@ -256,10 +306,22 @@ BOOL bind_to_iocp_for_server_context(PSERVER_CONTEXT server_context, HANDLE iocp
 	return TRUE;
 }
 
-BOOL init_wasiIoctl(SOCKET socket, GUID guid, LPFN_ACCEPTEX *fn_acceptex, LPDWORD size) {
+BOOL init_fn_acceptex(SOCKET socket, GUID guid, LPFN_ACCEPTEX *fn, LPDWORD size) {
 	int code = WSAIoctl(socket, SIO_GET_EXTENSION_FUNCTION_POINTER,
 		&guid, sizeof(GUID),
-		fn_acceptex, sizeof(LPFN_ACCEPTEX),
+		fn, sizeof(LPFN_ACCEPTEX),
+		size, NULL, NULL);
+	if (code != NO_ERROR) {
+		printf("[FATAL]WSAIoctl failed with error code: %d\n", WSAGetLastError());
+		return FALSE;
+	}
+	return TRUE;
+}
+
+BOOL init_fn_getacceptexsockaddrs(SOCKET socket, GUID guid, LPFN_GETACCEPTEXSOCKADDRS *fn, LPDWORD size) {
+	int code = WSAIoctl(socket, SIO_GET_EXTENSION_FUNCTION_POINTER,
+		&guid, sizeof(GUID),
+		fn, sizeof(LPFN_GETACCEPTEXSOCKADDRS),
 		size, NULL, NULL);
 	if (code != NO_ERROR) {
 		printf("[FATAL]WSAIoctl failed with error code: %d\n", WSAGetLastError());
@@ -301,15 +363,15 @@ void disconnect_listener() {
 
 BOOL init_events(PEVENTS *events, EVENT_LISTENER connect_listener
 	, EVENT_LISTENER receive_listener, EVENT_LISTENER disconnect_listener) {
-	 PEVENTS e = malloc(1, sizeof(EVENTS));
+	 PEVENTS e = malloc(sizeof(EVENTS));
 	 e->connect_listener = connect_listener;
 	 e->receive_listener = receive_listener;
 	 e->disconnect_listener = disconnect_listener;
-	 *events = e;
 	 if (e == NULL) {
 		 printf("[FATAL] Fail to allocate memory for EVENTS\n");
 		 return FALSE;
 	 }
+	 *events = e;
 	 return TRUE;
  }
 
@@ -370,26 +432,67 @@ unsigned __stdcall process(void *parameter) {
 	return 0;
 }
 
-BOOL new_server_socket(PCWSTR port, DWORD buffer_size, PADDRINFOW hints, EVENT_LISTENER connect_listener
+void new_server_socket(PCWSTR port, DWORD buffer_size, PADDRINFOW hints, EVENT_LISTENER connect_listener
 	, EVENT_LISTENER receive_listener, EVENT_LISTENER disconnect_listener) {
 	PSERVER_CONTEXT server_context;
 	if (init_server_context(port, buffer_size, connect_listener
 		, receive_listener, disconnect_listener
-		, hints, &server_context)
-		&& do_listen(server_context->socket, server_context->info)) {
-		SYSTEM_INFO systemInfo;
-		GetSystemInfo(&systemInfo);
-		unsigned int threadId = NULL;
-		for (DWORD i = 0; i < systemInfo.dwNumberOfProcessors; i++) {
-			PSOCKET_CONTEXT socket_context;
-			if (init_socket_context(&socket_context, server_context->info, buffer_size)
-				&& do_accept(server_context, socket_context)) {
-				HANDLE thread = _beginthreadex(NULL, 0, process, server_context, 0, &threadId);
-				printf("Thread after %d \n", threadId);
+		, hints, &server_context)) {
+		if (do_listen(server_context->socket, server_context->info)) {
+			SYSTEM_INFO systemInfo;
+			GetSystemInfo(&systemInfo);
+			unsigned int threadId = NULL;
+			for (DWORD i = 0; i < systemInfo.dwNumberOfProcessors; i++) {
+				PSOCKET_CONTEXT socket_context;
+				if (init_socket_context(&socket_context, server_context->info, buffer_size)) {
+					if (do_accept(server_context, socket_context)) {
+						HANDLE thread = _beginthreadex(NULL, 0, process, server_context, 0, &threadId);
+						printf("Thread after %d \n", threadId);
+					} else {
+						close(socket_context->socket);
+						free(socket_context->wsabuf.buf);
+						free(socket_context);
+						// TODO: Add a timer which will call init_socket_context do_accept _beginthreadex again.
+					}
+				} else {
+					// TODO: Add a timer which will call init_socket_context do_accept _beginthreadex again.
+				}
 			}
+		} else {
+			free(server_context->events);
+			do_close_handle(server_context->socket);
+			do_close_socket(server_context->socket);
+			FreeAddrInfoW(server_context->info);
+			do_wsacleanup();
+			free(server_context);
+			// TODO: Add a timer which will start up server socket.
 		}
+	} else {
+		// TODO: Add a timer which will start up server socket.
 	}
 }
+
+BOOL do_wsacleanup() {
+	int code = WSACleanup();
+	if (code != NOERROR) {
+		printf("[FATAL]WSACleanup failed with error code: %d\n", WSAGetLastError());
+	}
+}
+
+ADDRINFOW new_hints() {
+	ADDRINFOW hints;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_flags = AI_PASSIVE;
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_IP;
+	hints.ai_addrlen = 0;
+	hints.ai_canonname = NULL;
+	hints.ai_addr = NULL;
+	hints.ai_next = NULL;
+	return hints;
+}
+
 
 int main(void) {
 	PCWSTR port = L"9999";
